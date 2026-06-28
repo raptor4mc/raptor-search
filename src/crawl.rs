@@ -1,6 +1,3 @@
-use aws_config::Region;
-use aws_credential_types::Credentials;
-use aws_sdk_s3::{Client as S3Client, Config as S3Config};
 use scraper::{Html, Selector};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -14,28 +11,17 @@ const STOPWORDS: &[&str] = &[
     "she", "my", "your", "our", "can", "also",
 ];
 
+const BAD_EXTENSIONS: &[&str] = &[
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".zip", ".tar",
+    ".pdf", ".woff", ".woff2", ".ttf", ".css", ".js", ".xml", ".json",
+    ".mp4", ".mp3", ".webm", ".wav", ".otf", ".eot",
+];
+
 pub struct CrawledPage {
     pub title: String,
     pub snippet: String,
-    pub filtered_content: String,
     pub content_hash: String,
     pub discovered_urls: Vec<String>,
-}
-
-pub fn build_s3_client() -> S3Client {
-    let key_id = std::env::var("B2_KEY_ID").expect("B2_KEY_ID not set");
-    let app_key = std::env::var("B2_APPLICATION_KEY").expect("B2_APPLICATION_KEY not set");
-    let endpoint = std::env::var("B2_ENDPOINT").expect("B2_ENDPOINT not set");
-
-    let creds = Credentials::new(&key_id, &app_key, None, None, "env");
-    let config = S3Config::builder()
-        .credentials_provider(creds)
-        .region(Region::new("auto"))
-        .endpoint_url(endpoint)
-        .behavior_version_latest()
-        .build();
-
-    S3Client::from_conf(config)
 }
 
 pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error + Send + Sync>> {
@@ -50,15 +36,13 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
         .unwrap_or_else(|| "No title".to_string());
 
     let raw_text: String = document.root_element().text().collect::<Vec<_>>().join(" ");
-
-    let filtered_content = filter_stopwords(&raw_text);
-    let snippet = filtered_content.chars().take(200).collect();
+    let filtered = filter_stopwords(&raw_text);
+    let snippet: String = filtered.chars().take(200).collect();
 
     let mut hasher = Sha256::new();
     hasher.update(raw_text.as_bytes());
     let content_hash = hex::encode(hasher.finalize());
 
-    // Extract links
     let link_sel = Selector::parse("a[href]").unwrap();
     let base_url = reqwest::Url::parse(url)?;
     let mut discovered_urls = Vec::new();
@@ -78,11 +62,11 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
                 continue;
             };
 
-            // Only keep URLs with rust or crate in them
             let lower = absolute.to_lowercase();
             if (lower.contains("rust") || lower.contains("crate"))
                 && !lower.contains('#')
                 && absolute.starts_with("http")
+                && !BAD_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
             {
                 discovered_urls.push(absolute);
             }
@@ -92,7 +76,6 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
     Ok(CrawledPage {
         title,
         snippet,
-        filtered_content,
         content_hash,
         discovered_urls,
     })
@@ -111,7 +94,6 @@ fn filter_stopwords(text: &str) -> String {
 
 pub async fn store_page(
     pool: &PgPool,
-    _s3: &S3Client,
     url: &str,
     page: &CrawledPage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

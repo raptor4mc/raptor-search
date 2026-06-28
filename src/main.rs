@@ -14,7 +14,7 @@ use tower_http::{
 mod crawl;
 mod db;
 
-use crawl::{build_s3_client, crawl, store_page};
+use crawl::{crawl, store_page};
 use db::init_db;
 
 const SEED_URLS: &[&str] = &[
@@ -107,7 +107,6 @@ async fn seed_crawl_queue(pool: &PgPool) {
 }
 
 async fn run_crawler(pool: Arc<PgPool>) {
-    let s3 = build_s3_client();
     let count: (i64,) = sqlx::query_as("SELECT count(*) FROM crawl_queue WHERE status = 'pending'")
         .fetch_one(pool.as_ref())
         .await
@@ -134,7 +133,7 @@ async fn run_crawler(pool: Arc<PgPool>) {
             Some((id, url)) => {
                 println!("Crawling: {}", url);
                 match crawl(&url).await {
-                    Ok(page) => match store_page(pool.as_ref(), &s3, &url, &page).await {
+                    Ok(page) => match store_page(pool.as_ref(), &url, &page).await {
                         Ok(_) => {
     let _ = sqlx::query(
         "UPDATE crawl_queue SET status = 'done' WHERE id = $1"
