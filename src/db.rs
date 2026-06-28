@@ -1,17 +1,9 @@
-use rusqlite::{Connection, Result};
+use sqlx::postgres::PgPoolOptions;
 
-pub fn init_db() -> Result<Connection> {
-    let conn = Connection::open("service.db")?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS pages (
-            id INTEGER PRIMARY KEY,
-            url TEXT UNIQUE,
-            title TEXT,
-            content TEXT
-        )",
-        [],
-    )?;
-
-    Ok(conn)
+pub async fn init_db(database_url: &str) -> Result<sqlx::PgPool, sqlx::Error> {
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(database_url)
+        .await?;
+    Ok(pool)
 }
