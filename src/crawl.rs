@@ -14,7 +14,18 @@ const STOPWORDS: &[&str] = &[
 const BAD_EXTENSIONS: &[&str] = &[
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".zip", ".tar",
     ".pdf", ".woff", ".woff2", ".ttf", ".css", ".js", ".xml", ".json",
-    ".mp4", ".mp3", ".webm", ".wav", ".otf", ".eot",
+    ".mp4", ".mp3", ".webm", ".wav", ".otf", ".eot", ".exe", ".dmg",
+    ".gz", ".rar", ".7z", ".iso",
+];
+
+// Don't extract links FROM these domains
+// (we still crawl them if linked to, just don't follow their links)
+const NO_FOLLOW_DOMAINS: &[&str] = &[
+    "twitter.com", "x.com", "facebook.com", "instagram.com",
+    "tiktok.com", "linkedin.com", "pinterest.com", "snapchat.com",
+    "youtube.com", "youtu.be", "twitch.tv", "discord.com",
+    "discord.gg", "t.me", "telegram.org", "whatsapp.com",
+    "reddit.com", "news.ycombinator.com", "medium.com",
 ];
 
 pub struct CrawledPage {
@@ -47,28 +58,34 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
     let base_url = reqwest::Url::parse(url)?;
     let mut discovered_urls = Vec::new();
 
-    for element in document.select(&link_sel) {
-        if let Some(href) = element.value().attr("href") {
-            let absolute = if href.starts_with("http") {
-                href.to_string()
-            } else if href.starts_with('/') {
-                format!(
-                    "{}://{}{}",
-                    base_url.scheme(),
-                    base_url.host_str().unwrap_or(""),
-                    href
-                )
-            } else {
-                continue;
-            };
+    // Don't follow links from social media / video sites
+    let should_follow = !NO_FOLLOW_DOMAINS.iter().any(|d| {
+        base_url.host_str().unwrap_or("").contains(d)
+    });
 
-            let lower = absolute.to_lowercase();
-            if (lower.contains("rust") || lower.contains("crate"))
-                && !lower.contains('#')
-                && absolute.starts_with("http")
-                && !BAD_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
-            {
-                discovered_urls.push(absolute);
+    if should_follow {
+        for element in document.select(&link_sel) {
+            if let Some(href) = element.value().attr("href") {
+                let absolute = if href.starts_with("http") {
+                    href.to_string()
+                } else if href.starts_with('/') {
+                    format!(
+                        "{}://{}{}",
+                        base_url.scheme(),
+                        base_url.host_str().unwrap_or(""),
+                        href
+                    )
+                } else {
+                    continue;
+                };
+
+                let lower = absolute.to_lowercase();
+                if !lower.contains('#')
+                    && absolute.starts_with("http")
+                    && !BAD_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+                {
+                    discovered_urls.push(absolute);
+                }
             }
         }
     }
