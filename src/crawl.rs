@@ -18,8 +18,6 @@ const BAD_EXTENSIONS: &[&str] = &[
     ".gz", ".rar", ".7z", ".iso",
 ];
 
-// Don't extract links FROM these domains
-// (we still crawl them if linked to, just don't follow their links)
 const NO_FOLLOW_DOMAINS: &[&str] = &[
     "twitter.com", "x.com", "facebook.com", "instagram.com",
     "tiktok.com", "linkedin.com", "pinterest.com", "snapchat.com",
@@ -28,11 +26,36 @@ const NO_FOLLOW_DOMAINS: &[&str] = &[
     "reddit.com", "news.ycombinator.com", "medium.com",
 ];
 
+const SKIP_URL_PATTERNS: &[&str] = &[
+    "github.com/blob/",
+    "github.com/actions/",
+    "github.com/commit/",
+    "github.com/pull/",
+    "github.com/issues/",
+    "github.com/compare/",
+    "github.com/releases/",
+    "github.com/edit/",
+    "github.com/tree/",
+];
+
+const JUNK_SIGNALS: &[&str] = &[
+    "window.WIZ_global_data",
+    "window.__",
+    ":root {",
+    "featureFlags",
+    "var _gaq",
+    "WIZ_global",
+];
+
 pub struct CrawledPage {
     pub title: String,
     pub snippet: String,
     pub content_hash: String,
     pub discovered_urls: Vec<String>,
+}
+
+pub fn is_junk_url(url: &str) -> bool {
+    SKIP_URL_PATTERNS.iter().any(|p| url.contains(p))
 }
 
 pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error + Send + Sync>> {
@@ -46,7 +69,20 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
         .map(|t| t.inner_html())
         .unwrap_or_else(|| "No title".to_string());
 
-    let raw_text: String = document.root_element().text().collect::<Vec<_>>().join(" ");
+    // Extract from <p> tags first for better snippets
+    let p_sel = Selector::parse("p").unwrap();
+    let p_text: String = document
+        .select(&p_sel)
+        .map(|el| el.text().collect::<Vec<_>>().join(" "))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let raw_text = if p_text.trim().len() > 100 {
+        p_text
+    } else {
+        document.root_element().text().collect::<Vec<_>>().join(" ")
+    };
+
     let filtered = filter_stopwords(&raw_text);
     let snippet: String = filtered.chars().take(200).collect();
 
@@ -58,7 +94,6 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
     let base_url = reqwest::Url::parse(url)?;
     let mut discovered_urls = Vec::new();
 
-    // Don't follow links from social media / video sites
     let should_follow = !NO_FOLLOW_DOMAINS.iter().any(|d| {
         base_url.host_str().unwrap_or("").contains(d)
     });
@@ -83,6 +118,7 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
                 if !lower.contains('#')
                     && absolute.starts_with("http")
                     && !BAD_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+                    && !SKIP_URL_PATTERNS.iter().any(|p| absolute.contains(p))
                 {
                     discovered_urls.push(absolute);
                 }
@@ -114,6 +150,15 @@ pub async fn store_page(
     url: &str,
     page: &CrawledPage,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Skip junk pages
+    if JUNK_SIGNALS.iter().any(|s| page.snippet.contains(s)) {
+        println!("Skipping junk: {}", url);
+        return Ok(());
+    }
+
+    // Normalize URL
+    let url = url.trim_end_matches('/');
+
     let existing: Option<(String,)> =
         sqlx::query_as("SELECT content_hash FROM pages WHERE url = $1")
             .bind(url)
