@@ -16,6 +16,10 @@ mod db;
 
 use crawl::{crawl, is_junk_url, store_page};
 use db::init_db;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
+use tokio::sync::Semaphore;
 
 const SEED_URLS: &[&str] = &[
     "https://www.rust-lang.org",
@@ -84,9 +88,19 @@ async fn main() {
 
     if !search_only {
         let pool_crawler = pool.clone();
-        tokio::spawn(async move {
-            run_crawler(pool_crawler).await;
-        });
+        // Per-host last access timestamps for politeness
+        let host_access: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+        let host_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let workers: usize = std::env::var("CRAWL_WORKERS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+
+        for _ in 0..workers {
+            let pool_worker = pool_crawler.clone();
+            let host_access = host_access.clone();
+            let host_semaphores = host_semaphores.clone();
+            tokio::spawn(async move {
+                run_crawler_with_politeness(pool_worker, host_access, host_semaphores).await;
+            });
+        }
     }
 
     let state = AppState { db: pool };
@@ -119,10 +133,18 @@ async fn seed_crawl_queue(pool: &PgPool) {
     }
 }
 
-async fn run_crawler(pool: Arc<PgPool>) {
+async fn run_crawler_with_politeness(
+    pool: Arc<PgPool>,
+    host_access: Arc<Mutex<HashMap<String, Instant>>>,
+    host_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+) {
+    let politeness = Duration::from_secs(1);
     loop {
+        // Atomically claim a pending row to avoid races between workers.
         let row: Option<(i32, String)> = sqlx::query_as(
-            "SELECT id, url FROM crawl_queue WHERE status = 'pending' ORDER BY id ASC LIMIT 1"
+            "UPDATE crawl_queue SET status = 'processing', attempted_at = now() WHERE id = (
+                SELECT id FROM crawl_queue WHERE status = 'pending' ORDER BY id ASC LIMIT 1
+            ) RETURNING id, url"
         )
         .fetch_optional(pool.as_ref())
         .await
@@ -130,13 +152,6 @@ async fn run_crawler(pool: Arc<PgPool>) {
 
         match row {
             Some((id, url)) => {
-                let _ = sqlx::query(
-                    "UPDATE crawl_queue SET status = 'processing', attempted_at = now() WHERE id = $1"
-                )
-                .bind(id)
-                .execute(pool.as_ref())
-                .await;
-
                 // Skip junk URLs
                 if is_junk_url(&url) {
                     let _ = sqlx::query(
@@ -148,44 +163,85 @@ async fn run_crawler(pool: Arc<PgPool>) {
                     continue;
                 }
 
-                println!("Crawling: {}", url);
-                let crawl_result = crawl(&url).await;
-                match crawl_result {
-                    Ok(page) => {
-                        let store_result = store_page(pool.as_ref(), &url, &page).await;
-                        match store_result {
-                            Ok(_) => {
-                                let _ = sqlx::query(
-                                    "UPDATE crawl_queue SET status = 'done' WHERE id = $1"
-                                )
-                                .bind(id)
-                                .execute(pool.as_ref())
-                                .await;
-                                println!("Done: {}", url);
+                // politeness: per-host delay + per-host concurrency semaphore
+                if let Ok(parsed) = reqwest::Url::parse(&url) {
+                    if let Some(host) = parsed.host_str() {
+                        // get or create semaphore for host
+                        let sem = {
+                            let mut sems = host_semaphores.lock().await;
+                            sems.entry(host.to_string())
+                                .or_insert_with(|| Arc::new(Semaphore::new(2)))
+                                .clone()
+                        };
 
-                                for discovered in &page.discovered_urls {
-                                    let _ = sqlx::query(
-                                        "INSERT INTO crawl_queue (url) VALUES ($1) ON CONFLICT (url) DO NOTHING"
-                                    )
-                                    .bind(discovered)
-                                    .execute(pool.as_ref())
-                                    .await;
+                        // acquire permit
+                        let permit = sem.acquire_owned().await.unwrap();
 
-                                    // PageRank: increment inbound links
-                                    let _ = sqlx::query(
-                                        "UPDATE pages SET inbound_links = inbound_links + 1 WHERE url = $1 OR url = rtrim($1, '/')"
-                                    )
-                                    .bind(discovered)
-                                    .execute(pool.as_ref())
-                                    .await;
-                                }
+                        let mut map = host_access.lock().await;
+                        if let Some(last) = map.get(host) {
+                            let elapsed = last.elapsed();
+                            if elapsed < politeness {
+                                let wait = politeness - elapsed;
+                                tokio::time::sleep(wait).await;
+                            }
+                        }
+                        map.insert(host.to_string(), Instant::now());
 
-                                if !page.discovered_urls.is_empty() {
-                                    println!("Queued {} new URLs from {}", page.discovered_urls.len(), url);
+                        println!("Crawling: {}", url);
+                        let crawl_result = crawl(&url).await;
+
+                        // permit drops here when out of scope
+                        drop(permit);
+                        // continue handling result below
+                        match crawl_result {
+                            Ok(page) => {
+                                let store_result = store_page(pool.as_ref(), &url, &page).await;
+                                match store_result {
+                                    Ok(_) => {
+                                        let _ = sqlx::query(
+                                            "UPDATE crawl_queue SET status = 'done' WHERE id = $1"
+                                        )
+                                        .bind(id)
+                                        .execute(pool.as_ref())
+                                        .await;
+
+                                        println!("Done: {}", url);
+
+                                        for discovered in &page.discovered_urls {
+                                            let _ = sqlx::query(
+                                                "INSERT INTO crawl_queue (url) VALUES ($1) ON CONFLICT (url) DO NOTHING"
+                                            )
+                                            .bind(discovered)
+                                            .execute(pool.as_ref())
+                                            .await;
+
+                                            // PageRank: increment inbound links
+                                            let _ = sqlx::query(
+                                                "UPDATE pages SET inbound_links = inbound_links + 1 WHERE url = $1 OR url = rtrim($1, '/')"
+                                            )
+                                            .bind(discovered)
+                                            .execute(pool.as_ref())
+                                            .await;
+                                        }
+
+                                        if !page.discovered_urls.is_empty() {
+                                            println!("Queued {} new URLs from {}", page.discovered_urls.len(), url);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("Store error for {}: {}", url, e);
+                                        let _ = sqlx::query(
+                                            "UPDATE crawl_queue SET status = 'failed' WHERE id = $1"
+                                        )
+                                        .bind(id)
+                                        .execute(pool.as_ref())
+                                        .await;
+                                    }
                                 }
                             }
                             Err(e) => {
-                                eprintln!("Store error for {}: {}", url, e);
+                                eprintln!("Crawl error for {}: {}", url, e);
+                                drop(e);
                                 let _ = sqlx::query(
                                     "UPDATE crawl_queue SET status = 'failed' WHERE id = $1"
                                 )
@@ -194,10 +250,24 @@ async fn run_crawler(pool: Arc<PgPool>) {
                                 .await;
                             }
                         }
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
                     }
-                    Err(e) => {
-                        eprintln!("Crawl error for {}: {}", url, e);
-                        drop(e);
+                }
+                // If we couldn't parse the URL host or didn't handle above, do a simple fetch without semaphore.
+                println!("Crawling (ungarded): {}", url);
+                let crawl_result = crawl(&url).await;
+                if let Ok(page) = crawl_result {
+                    let store_result = store_page(pool.as_ref(), &url, &page).await;
+                    if store_result.is_ok() {
+                        let _ = sqlx::query(
+                            "UPDATE crawl_queue SET status = 'done' WHERE id = $1"
+                        )
+                        .bind(id)
+                        .execute(pool.as_ref())
+                        .await;
+                        println!("Done: {}", url);
+                    } else {
                         let _ = sqlx::query(
                             "UPDATE crawl_queue SET status = 'failed' WHERE id = $1"
                         )
@@ -205,6 +275,14 @@ async fn run_crawler(pool: Arc<PgPool>) {
                         .execute(pool.as_ref())
                         .await;
                     }
+                } else if let Err(e) = crawl_result {
+                    eprintln!("Crawl error for {}: {}", url, e);
+                    let _ = sqlx::query(
+                        "UPDATE crawl_queue SET status = 'failed' WHERE id = $1"
+                    )
+                    .bind(id)
+                    .execute(pool.as_ref())
+                    .await;
                 }
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
