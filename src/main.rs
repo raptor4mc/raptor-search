@@ -44,6 +44,17 @@ struct AppState {
 async fn main() {
     dotenvy::dotenv().ok();
 
+    // Auto-shutdown after timeout (for GitHub Actions)
+    if let Ok(secs) = std::env::var("CRAWL_TIMEOUT_SECS") {
+        if let Ok(secs) = secs.parse::<u64>() {
+            tokio::spawn(async move {
+                tokio::time::sleep(tokio::time::Duration::from_secs(secs)).await;
+                println!("Crawl timeout reached, shutting down.");
+                std::process::exit(0);
+            });
+        }
+    }
+
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL not set");
     let pool = init_db(&database_url)
         .await
@@ -135,27 +146,30 @@ async fn run_crawler(pool: Arc<PgPool>) {
                 match crawl(&url).await {
                     Ok(page) => match store_page(pool.as_ref(), &url, &page).await {
                         Ok(_) => {
-    let _ = sqlx::query(
-        "UPDATE crawl_queue SET status = 'done' WHERE id = $1"
-    )
-    .bind(id)
-    .execute(pool.as_ref())
-    .await;
-    println!("Done: {}", url);
+                            let _ =
+                                sqlx::query("UPDATE crawl_queue SET status = 'done' WHERE id = $1")
+                                    .bind(id)
+                                    .execute(pool.as_ref())
+                                    .await;
+                            println!("Done: {}", url);
 
-    // Queue discovered URLs
-    for discovered in &page.discovered_urls {
-        let _ = sqlx::query(
+                            // Queue discovered URLs
+                            for discovered in &page.discovered_urls {
+                                let _ = sqlx::query(
             "INSERT INTO crawl_queue (url) VALUES ($1) ON CONFLICT (url) DO NOTHING"
         )
         .bind(discovered)
         .execute(pool.as_ref())
         .await;
-    }
-    if !page.discovered_urls.is_empty() {
-        println!("Queued {} new URLs from {}", page.discovered_urls.len(), url);
-    }
-}
+                            }
+                            if !page.discovered_urls.is_empty() {
+                                println!(
+                                    "Queued {} new URLs from {}",
+                                    page.discovered_urls.len(),
+                                    url
+                                );
+                            }
+                        }
                         Err(e) => {
                             eprintln!("Store error for {}: {:?}", url, e);
                             let _ = sqlx::query(
