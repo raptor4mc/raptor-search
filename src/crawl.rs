@@ -1,6 +1,21 @@
 use scraper::{Html, Selector};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use once_cell::sync::Lazy;
+use rust_stemmers::{Algorithm, Stemmer};
+use std::time::Duration;
+use std::io::Write;
+use bytes::Bytes;
+
+static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent("raptor-search/0.1 (+https://github.com/raptor4mc)")
+        .build()
+        .expect("failed to build http client")
+});
+
+static STEMMER: Lazy<Stemmer> = Lazy::new(|| Stemmer::create(Algorithm::English));
 
 const STOPWORDS: &[&str] = &[
     "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
@@ -51,6 +66,7 @@ pub struct CrawledPage {
     pub title: String,
     pub snippet: String,
     pub content_hash: String,
+    pub content: String,
     pub discovered_urls: Vec<String>,
 }
 
@@ -58,8 +74,54 @@ pub fn is_junk_url(url: &str) -> bool {
     SKIP_URL_PATTERNS.iter().any(|p| url.contains(p))
 }
 
+pub fn normalize_url(u: &str) -> Option<String> {
+    let mut parsed = reqwest::Url::parse(u).ok()?;
+    // lowercase scheme and host
+    let scheme = parsed.scheme().to_lowercase();
+    let host = parsed.host_str()?.to_lowercase();
+    parsed.set_scheme(&scheme).ok()?;
+    parsed.set_host(Some(&host)).ok()?;
+    // remove fragment
+    parsed.set_fragment(None);
+
+    // strip common tracking query params
+    let mut pairs: Vec<(String, String)> = parsed
+        .query_pairs()
+        .into_owned()
+        .filter(|(k, _)| {
+            let kl = k.to_lowercase();
+            !kl.starts_with("utm_") && kl != "fbclid" && kl != "gclid" && kl != "mc_cid" && kl != "mc_eid"
+        })
+        .collect();
+    pairs.sort();
+    parsed.query_pairs_mut().clear().extend_pairs(pairs);
+    Some(parsed.into_string().trim_end_matches('/').to_string())
+}
+
 pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error + Send + Sync>> {
-    let body = reqwest::get(url).await?.text().await?;
+    // Prefer checking headers first to avoid downloading non-HTML or huge responses.
+    if let Ok(head) = CLIENT.head(url).send().await {
+        if head.status().is_success() {
+            if let Some(ct) = head.headers().get(reqwest::header::CONTENT_TYPE) {
+                let ct = ct.to_str().unwrap_or("");
+                if !ct.contains("text/html") {
+                    return Err("Non-HTML content, skipping".into());
+                }
+            }
+
+            if let Some(len) = head.headers().get(reqwest::header::CONTENT_LENGTH) {
+                if let Ok(len_str) = len.to_str() {
+                    if let Ok(n) = len_str.parse::<u64>() {
+                        if n > 2_000_000 {
+                            return Err("Content too large, skipping".into());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let body = CLIENT.get(url).send().await?.text().await?;
     let document = Html::parse_document(&body);
 
     let title_sel = Selector::parse("title").unwrap();
@@ -120,7 +182,9 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
                     && !BAD_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
                     && !SKIP_URL_PATTERNS.iter().any(|p| absolute.contains(p))
                 {
-                    discovered_urls.push(absolute);
+                    if let Some(n) = normalize_url(&absolute) {
+                        discovered_urls.push(n);
+                    }
                 }
             }
         }
@@ -130,16 +194,23 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
         title,
         snippet,
         content_hash,
+        content: raw_text,
         discovered_urls,
     })
 }
 
 fn filter_stopwords(text: &str) -> String {
     text.split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()))
         .filter(|word| {
             let lower = word.to_lowercase();
             let clean: String = lower.chars().filter(|c| c.is_alphabetic()).collect();
             !clean.is_empty() && !STOPWORDS.contains(&clean.as_str())
+        })
+        .map(|w| {
+            let lower = w.to_lowercase();
+            let clean: String = lower.chars().filter(|c| c.is_alphabetic()).collect();
+            STEMMER.stem(&clean).to_string()
         })
         .collect::<Vec<_>>()
         .join(" ")
@@ -187,6 +258,69 @@ pub async fn store_page(
     .bind(&page.content_hash)
     .execute(pool)
     .await?;
+
+    // Optionally offload compressed content to S3-compatible storage if configured.
+    if let Ok(bucket) = std::env::var("S3_BUCKET") {
+        if !page.content.is_empty() {
+            let key = format!("pages/{}.zst", page.content_hash);
+            // ensure page_blobs table exists
+            let _ = sqlx::query(
+                "CREATE TABLE IF NOT EXISTS page_blobs (
+                    content_hash TEXT PRIMARY KEY,
+                    s3_key TEXT,
+                    size BIGINT,
+                    uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+                )"
+            )
+            .execute(pool)
+            .await;
+
+            // compress to memory
+            let mut buf = Vec::new();
+            {
+                let mut encoder = zstd::stream::Encoder::new(&mut buf, 3)?;
+                encoder.write_all(page.content.as_bytes())?;
+                encoder.finish()?;
+            }
+
+            // upload using aws-sdk-s3
+            let config = aws_config::load_from_env().await;
+            let client = aws_sdk_s3::Client::new(&config);
+            let bucket_name = bucket;
+            let _ = client
+                .put_object()
+                .bucket(bucket_name)
+                .key(&key)
+                .body(Bytes::from(buf.clone()).into())
+                .send()
+                .await;
+
+            let _ = sqlx::query(
+                "INSERT INTO page_blobs (content_hash, s3_key, size) VALUES ($1, $2, $3)
+                 ON CONFLICT (content_hash) DO NOTHING"
+            )
+            .bind(&page.content_hash)
+            .bind(&key)
+            .bind(buf.len() as i64)
+            .execute(pool)
+            .await?;
+        }
+    } else {
+        // Fallback: save compressed full content to disk to reduce DB storage.
+        let dir = std::path::Path::new("database/pages");
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let path = dir.join(format!("{}.zst", page.content_hash));
+        if !path.exists() {
+            use std::fs::File;
+            use std::io::Write;
+            let f = File::create(&path)?;
+            let mut encoder = zstd::stream::Encoder::new(f, 3)?;
+            encoder.write_all(page.content.as_bytes())?;
+            encoder.finish()?;
+        }
+    }
 
     Ok(())
 }
