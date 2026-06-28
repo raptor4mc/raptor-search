@@ -2520,6 +2520,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rust-stemmers"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e46a2036019fdb888131db7a4c847a1063a7493f971ed94ea82c67eada63ca54"
+dependencies = [
+ "serde",
+ "serde_derive",
+]
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2799,10 +2809,13 @@ dependencies = [
  "aws-credential-types",
  "aws-sdk-s3",
  "axum",
+ "bytes",
  "chrono",
  "dotenvy",
  "hex",
+ "once_cell",
  "reqwest",
+ "rust-stemmers",
  "scraper",
  "serde",
  "serde_json",

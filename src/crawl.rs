@@ -51,6 +51,10 @@ const SKIP_URL_PATTERNS: &[&str] = &[
     "github.com/releases/",
     "github.com/edit/",
     "github.com/tree/",
+    "docs.rs",
+    "crates.io",
+    "codecov.io",
+    "github.com/workflows/",
 ];
 
 const JUNK_SIGNALS: &[&str] = &[
@@ -94,8 +98,24 @@ pub fn normalize_url(u: &str) -> Option<String> {
         })
         .collect();
     pairs.sort();
-    parsed.query_pairs_mut().clear().extend_pairs(pairs);
+    if pairs.is_empty() {
+        parsed.set_query(None);
+    } else {
+        parsed.query_pairs_mut().clear().extend_pairs(pairs);
+    }
     Some(parsed.into_string().trim_end_matches('/').to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_url;
+
+    #[test]
+    fn test_normalize() {
+        let u = "https://Example.COM:443/path/?utm_source=google#frag";
+        let n = normalize_url(u).unwrap();
+        assert_eq!(n, "https://example.com/path");
+    }
 }
 
 pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error + Send + Sync>> {
@@ -121,7 +141,31 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
         }
     }
 
-    let body = CLIENT.get(url).send().await?.text().await?;
+    // Retry GET with exponential backoff for transient errors.
+    let max_retries: u32 = std::env::var("CRAWL_MAX_RETRIES").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
+    let mut attempt: u32 = 0;
+    let body = loop {
+        let res = CLIENT.get(url).send().await;
+        match res {
+            Ok(resp) => match resp.text().await {
+                Ok(t) => break t,
+                Err(e) => {
+                    attempt += 1;
+                    if attempt > max_retries {
+                        return Err(Box::new(e));
+                    }
+                }
+            },
+            Err(e) => {
+                attempt += 1;
+                if attempt > max_retries {
+                    return Err(Box::new(e));
+                }
+            }
+        }
+        let backoff = 2u64.pow(attempt.min(6));
+        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+    };
     let document = Html::parse_document(&body);
 
     let title_sel = Selector::parse("title").unwrap();
@@ -188,6 +232,15 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
                 }
             }
         }
+    }
+
+    // Limit discovered URLs per page to avoid queue explosion
+    let max_discovered: usize = std::env::var("MAX_DISCOVERED_PER_PAGE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50);
+    if discovered_urls.len() > max_discovered {
+        discovered_urls.truncate(max_discovered);
     }
 
     Ok(CrawledPage {
@@ -322,5 +375,40 @@ pub async fn store_page(
         }
     }
 
+
+    // Prune or mark old pages can be handled separately; keep DB minimal here.
     Ok(())
+}
+
+// Prune pages older than TTL (days) and optionally delete S3 blobs
+pub async fn prune_old_pages(pool: &PgPool) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let days: i64 = std::env::var("PRUNE_DAYS").ok().and_then(|s| s.parse().ok()).unwrap_or(30);
+    let deleted = sqlx::query_scalar::<_, i64>(
+        "DELETE FROM pages WHERE crawled_at < now() - ($1::interval) RETURNING 1"
+    )
+    .bind(format!("{} days", days))
+    .fetch_all(pool)
+    .await?
+    .len();
+
+    // Optionally prune page_blobs and S3 objects
+    if let Ok(bucket) = std::env::var("S3_BUCKET") {
+        let rows: Vec<(String,String)> = sqlx::query_as("SELECT content_hash, s3_key FROM page_blobs WHERE uploaded_at < now() - ($1::interval)")
+            .bind(format!("{} days", days))
+            .fetch_all(pool)
+            .await?;
+        if !rows.is_empty() {
+            let config = aws_config::load_from_env().await;
+            let client = aws_sdk_s3::Client::new(&config);
+            for (_hash, key) in rows.iter() {
+                let _ = client.delete_object().bucket(&bucket).key(key).send().await;
+            }
+            let _ = sqlx::query("DELETE FROM page_blobs WHERE uploaded_at < now() - ($1::interval)")
+                .bind(format!("{} days", days))
+                .execute(pool)
+                .await?;
+        }
+    }
+
+    Ok(deleted)
 }

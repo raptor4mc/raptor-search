@@ -108,6 +108,7 @@ async fn main() {
     let app = Router::new()
         .route("/search", get(search))
         .route("/crawl", post(crawl_handler))
+        .route("/admin/prune", post(prune_handler))
         .fallback_service(ServeDir::new("static").append_index_html_on_directories(true))
         .with_state(state)
         .layer(
@@ -124,12 +125,14 @@ async fn main() {
 
 async fn seed_crawl_queue(pool: &PgPool) {
     for url in SEED_URLS {
-        let _ = sqlx::query(
-            "INSERT INTO crawl_queue (url) VALUES ($1) ON CONFLICT (url) DO NOTHING"
-        )
-        .bind(url)
-        .execute(pool)
-        .await;
+        if let Some(n) = crate::crawl::normalize_url(url) {
+            let _ = sqlx::query(
+                "INSERT INTO crawl_queue (url) VALUES ($1) ON CONFLICT (url) DO NOTHING"
+            )
+            .bind(n)
+            .execute(pool)
+            .await;
+        }
     }
 }
 
@@ -141,9 +144,10 @@ async fn run_crawler_with_politeness(
     let politeness = Duration::from_secs(1);
     loop {
         // Atomically claim a pending row to avoid races between workers.
+        // Claim a pending row, or retry failed rows that are old enough (visibility/backoff)
         let row: Option<(i32, String)> = sqlx::query_as(
             "UPDATE crawl_queue SET status = 'processing', attempted_at = now() WHERE id = (
-                SELECT id FROM crawl_queue WHERE status = 'pending' ORDER BY id ASC LIMIT 1
+                SELECT id FROM crawl_queue WHERE (status = 'pending' OR (status = 'failed' AND attempted_at < now() - INTERVAL '1 hour')) ORDER BY id ASC LIMIT 1
             ) RETURNING id, url"
         )
         .fetch_optional(pool.as_ref())
@@ -352,4 +356,13 @@ async fn crawl_handler(
     .execute(state.db.as_ref())
     .await;
     "Queued"
+}
+
+async fn prune_handler(
+    State(state): State<AppState>,
+) -> Json<String> {
+    match crate::crawl::prune_old_pages(state.db.as_ref()).await {
+        Ok(n) => Json(format!("Pruned {} pages", n)),
+        Err(e) => Json(format!("Prune failed: {}", e)),
+    }
 }
