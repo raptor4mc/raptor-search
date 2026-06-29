@@ -14,12 +14,13 @@ use tower_http::{
 mod crawl;
 mod db;
 
-use crawl::{crawl, is_junk_url, store_page};
+use crawl::{crawl, is_junk_url, store_page, storage_worker, StorageTask};
 use db::init_db;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
 
 const SEED_URLS: &[&str] = &[
     "https://www.rust-lang.org",
@@ -88,17 +89,28 @@ async fn main() {
 
     if !search_only {
         let pool_crawler = pool.clone();
+        
+        // Create channel for background storage tasks
+        let (storage_tx, storage_rx) = mpsc::unbounded_channel();
+        
+        // Spawn background storage worker
+        let pool_storage = pool.clone();
+        tokio::spawn(async move {
+            storage_worker(pool_storage, storage_rx).await;
+        });
+        
         // Per-host last access timestamps for politeness
         let host_access: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
         let host_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>> = Arc::new(Mutex::new(HashMap::new()));
-        let workers: usize = std::env::var("CRAWL_WORKERS").ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+        let workers: usize = std::env::var("CRAWL_WORKERS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
 
         for _ in 0..workers {
             let pool_worker = pool_crawler.clone();
             let host_access = host_access.clone();
             let host_semaphores = host_semaphores.clone();
+            let storage_tx = storage_tx.clone();
             tokio::spawn(async move {
-                run_crawler_with_politeness(pool_worker, host_access, host_semaphores).await;
+                run_crawler_with_politeness(pool_worker, host_access, host_semaphores, storage_tx).await;
             });
         }
     }
@@ -140,6 +152,7 @@ async fn run_crawler_with_politeness(
     pool: Arc<PgPool>,
     host_access: Arc<Mutex<HashMap<String, Instant>>>,
     host_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    storage_tx: mpsc::UnboundedSender<StorageTask>,
 ) {
     let politeness = Duration::from_secs(1);
     loop {
@@ -199,7 +212,7 @@ async fn run_crawler_with_politeness(
                         // continue handling result below
                         match crawl_result {
                             Ok(page) => {
-                                let store_result = store_page(pool.as_ref(), &url, &page).await;
+                                let store_result = store_page(pool.as_ref(), &url, &page, Some(storage_tx.clone())).await;
                                 match store_result {
                                     Ok(_) => {
                                         let _ = sqlx::query(
@@ -262,7 +275,7 @@ async fn run_crawler_with_politeness(
                 println!("Crawling (ungarded): {}", url);
                 let crawl_result = crawl(&url).await;
                 if let Ok(page) = crawl_result {
-                    let store_result = store_page(pool.as_ref(), &url, &page).await;
+                    let store_result = store_page(pool.as_ref(), &url, &page, Some(storage_tx.clone())).await;
                     if store_result.is_ok() {
                         let _ = sqlx::query(
                             "UPDATE crawl_queue SET status = 'done' WHERE id = $1"

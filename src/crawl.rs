@@ -6,6 +6,8 @@ use rust_stemmers::{Algorithm, Stemmer};
 use std::time::Duration;
 use std::io::Write;
 use bytes::Bytes;
+use tokio::sync::mpsc;
+use std::sync::Arc;
 
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
@@ -65,6 +67,13 @@ const JUNK_SIGNALS: &[&str] = &[
     "var _gaq",
     "WIZ_global",
 ];
+
+#[derive(Debug, Clone)]
+pub struct StorageTask {
+    pub url: String,
+    pub content: String,
+    pub content_hash: String,
+}
 
 pub struct CrawledPage {
     pub title: String,
@@ -273,6 +282,7 @@ pub async fn store_page(
     pool: &PgPool,
     url: &str,
     page: &CrawledPage,
+    storage_tx: Option<mpsc::UnboundedSender<StorageTask>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Skip junk pages
     if JUNK_SIGNALS.iter().any(|s| page.snippet.contains(s)) {
@@ -312,71 +322,100 @@ pub async fn store_page(
     .execute(pool)
     .await?;
 
-    // Optionally offload compressed content to S3-compatible storage if configured.
-    if let Ok(bucket) = std::env::var("S3_BUCKET") {
-        if !page.content.is_empty() {
-            let key = format!("pages/{}.zst", page.content_hash);
-            // ensure page_blobs table exists
-            let _ = sqlx::query(
-                "CREATE TABLE IF NOT EXISTS page_blobs (
-                    content_hash TEXT PRIMARY KEY,
-                    s3_key TEXT,
-                    size BIGINT,
-                    uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT now()
-                )"
-            )
-            .execute(pool)
-            .await;
+    // Offload storage (S3 or disk) to background task
+    if let Some(tx) = storage_tx {
+        let task = StorageTask {
+            url: url.to_string(),
+            content: page.content.clone(),
+            content_hash: page.content_hash.clone(),
+        };
+        let _ = tx.send(task);
+    }
 
-            // compress to memory
-            let mut buf = Vec::new();
-            {
-                let mut encoder = zstd::stream::Encoder::new(&mut buf, 3)?;
-                encoder.write_all(page.content.as_bytes())?;
-                encoder.finish()?;
-            }
+    Ok(())
+}
 
-            // upload using aws-sdk-s3
-            let config = aws_config::load_from_env().await;
-            let client = aws_sdk_s3::Client::new(&config);
-            let bucket_name = bucket;
-            let _ = client
-                .put_object()
-                .bucket(bucket_name)
-                .key(&key)
-                .body(Bytes::from(buf.clone()).into())
-                .send()
-                .await;
-
-            let _ = sqlx::query(
-                "INSERT INTO page_blobs (content_hash, s3_key, size) VALUES ($1, $2, $3)
-                 ON CONFLICT (content_hash) DO NOTHING"
-            )
-            .bind(&page.content_hash)
-            .bind(&key)
-            .bind(buf.len() as i64)
-            .execute(pool)
-            .await?;
+// Background worker to handle storage tasks (S3 uploads or disk storage)
+pub async fn storage_worker(
+    pool: Arc<PgPool>,
+    mut rx: mpsc::UnboundedReceiver<StorageTask>,
+) {
+    while let Some(task) = rx.recv().await {
+        if let Err(e) = process_storage_task(&pool, &task).await {
+            eprintln!("Storage task failed for {}: {}", task.url, e);
         }
+    }
+}
+
+async fn process_storage_task(
+    pool: &PgPool,
+    task: &StorageTask,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if task.content.is_empty() {
+        return Ok(());
+    }
+
+    // Compress content
+    let mut buf = Vec::new();
+    {
+        let mut encoder = zstd::stream::Encoder::new(&mut buf, 3)?;
+        encoder.write_all(task.content.as_bytes())?;
+        encoder.finish()?;
+    }
+
+    // Try S3 if configured, otherwise disk
+    if let Ok(bucket) = std::env::var("S3_BUCKET") {
+        let key = format!("pages/{}.zst", task.content_hash);
+        
+        // Ensure table exists
+        let _ = sqlx::query(
+            "CREATE TABLE IF NOT EXISTS page_blobs (
+                content_hash TEXT PRIMARY KEY,
+                s3_key TEXT,
+                size BIGINT,
+                uploaded_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+            )"
+        )
+        .execute(pool)
+        .await;
+
+        // Upload to S3
+        let config = aws_config::load_from_env().await;
+        let client = aws_sdk_s3::Client::new(&config);
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(&key)
+            .body(Bytes::from(buf.clone()).into())
+            .send()
+            .await?;
+
+        // Record in DB
+        let _ = sqlx::query(
+            "INSERT INTO page_blobs (content_hash, s3_key, size) VALUES ($1, $2, $3)
+             ON CONFLICT (content_hash) DO NOTHING"
+        )
+        .bind(&task.content_hash)
+        .bind(&key)
+        .bind(buf.len() as i64)
+        .execute(pool)
+        .await?;
     } else {
-        // Fallback: save compressed full content to disk to reduce DB storage.
+        // Fallback to disk storage
         let dir = std::path::Path::new("database/pages");
         if !dir.exists() {
             std::fs::create_dir_all(dir)?;
         }
-        let path = dir.join(format!("{}.zst", page.content_hash));
+        let path = dir.join(format!("{}.zst", task.content_hash));
         if !path.exists() {
             use std::fs::File;
-            use std::io::Write;
             let f = File::create(&path)?;
             let mut encoder = zstd::stream::Encoder::new(f, 3)?;
-            encoder.write_all(page.content.as_bytes())?;
+            encoder.write_all(task.content.as_bytes())?;
             encoder.finish()?;
         }
     }
 
-
-    // Prune or mark old pages can be handled separately; keep DB minimal here.
     Ok(())
 }
 
