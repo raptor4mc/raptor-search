@@ -1,27 +1,33 @@
+const SUPABASE_URL = "https://nxipygonwjlxozfsrbsn.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_lt5n95QnheWul-URwQHtog_XBHya10T";
+
 const input = document.getElementById("searchInput");
 const button = document.getElementById("searchButton");
 const results = document.getElementById("results");
 let currentPage = 0;
-let currentQuery = "";
 
 async function search(page = 0) {
     const query = input.value.trim();
     if (query === "") return;
-    currentQuery = query;
     currentPage = page;
     results.innerHTML = "Searching...";
     try {
         const response = await fetch(
-            "/search?q=" + encodeURIComponent(query) + "&page=" + page
+            `${SUPABASE_URL}/rest/v1/rpc/search_pages`,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": `Bearer ${SUPABASE_ANON_KEY}`
+                },
+                body: JSON.stringify({ query: query, page_num: page })
+            }
         );
         const data = await response.json();
         results.innerHTML = "";
-        if (data.length === 0 && page === 0) {
-            results.innerHTML = "<p>No results found.</p>";
-            return;
-        }
-        if (data.length === 0) {
-            results.innerHTML = "<p>No more results.</p>";
+        if (!data.length) {
+            results.innerHTML = page === 0 ? "<p>No results found.</p>" : "<p>No more results.</p>";
             return;
         }
         for (const item of data) {
@@ -50,7 +56,7 @@ async function search(page = 0) {
         }
         results.appendChild(nav);
     } catch (e) {
-        results.innerHTML = "<p>Could not contact backend.</p>";
+        results.innerHTML = "<p>Search failed.</p>";
         console.error(e);
     }
 }
