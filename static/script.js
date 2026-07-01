@@ -64,4 +64,4 @@ async function search(page = 0) {
 button.onclick = () => search(0);
 input.addEventListener("keydown", e => {
     if (e.key === "Enter") search(0);
-});
+}); //should work right now
