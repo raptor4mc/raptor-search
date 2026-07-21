@@ -2,19 +2,21 @@ name: Raptor Crawler
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # ✅ Every 6 hours (was */12)
-    - cron: '0 0 */5 * *'  # Every 5 days (keep-alive)
-  workflow_dispatch:
+    - cron: '0 */04 * * *'  # every 12 hours
+    - cron: '0 0 */5 * *'   # every 5 days (Supabase keep-alive)
+  workflow_dispatch:          # manual trigger button in GitHub UI
 
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 360  # ✅ 6 hours max (was 55)
+    timeout-minutes: 190
 
     steps:
       - uses: actions/checkout@v4
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -23,9 +25,11 @@ jobs:
             ~/.cargo/git
             target/
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
       - name: Build
         run: cargo build --release
-      - name: Run crawler (5h 20m = 19,200 seconds)
+
+      - name: Run crawler (50 min window)
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
@@ -35,12 +39,16 @@ jobs:
           B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
           B2_BUCKET_NAME: ${{ secrets.B2_BUCKET_NAME }}
           B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
-          CRAWL_TIMEOUT_SECS: "19200"  # ✅ 5h 20m (was 3000)
-        run: timeout 19200 ./target/release/service-backend || true
-      - name: Ping Supabase (keep-alive)
-        if: github.event.schedule == '0 0 */5 * *'
+          CRAWL_TIMEOUT_SECS: "3000"
+        run: timeout 3000 ./target/release/service-backend || true
+
+  keepalive:
+    runs-on: ubuntu-latest
+    if: github.event.schedule == '0 0 */5 * *'
+    steps:
+      - name: Ping Supabase
         run: |
           curl -s "${{ secrets.SUPABASE_URL }}/rest/v1/pages?limit=1" \
             -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
             -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}"
-          echo "✅ Supabase pinged!"   
+          echo "Supabase pinged!"
