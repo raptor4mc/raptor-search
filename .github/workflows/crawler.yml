@@ -17,6 +17,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Update CA Certificates
+        run: sudo apt-get update && sudo apt-get install -y ca-certificates   
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
