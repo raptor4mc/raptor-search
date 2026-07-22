@@ -38,11 +38,41 @@ const SEED_URLS: &[&str] = &[
     "https://github.com/rust-lang/rust",
     "https://github.com/rust-lang/cargo",
     "https://reddit.com/r/rust.json",
+    "https://proton.me",
+    "https://brave.com",
+    "https://www.youtube.com/@letsgetrusty",
+    "https://github.com",
+    "https://discord.com",
+    "https://bsky.app/profile/rust-lang.org",
+    "https://claude.ai",
+    "https://serv1ce.pages.dev",
 ];
 
 #[derive(Clone)]
 struct AppState {
     db: Arc<PgPool>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CrawlDirection {
+    Front, // oldest pending rows first (id ASC) — works down the existing backlog
+    Back,  // newest pending rows first (id DESC) — works from freshly discovered URLs
+}
+
+impl CrawlDirection {
+    fn from_env() -> Self {
+        match std::env::var("CRAWL_DIRECTION").unwrap_or_default().to_lowercase().as_str() {
+            "back" | "backward" => CrawlDirection::Back,
+            _ => CrawlDirection::Front,
+        }
+    }
+
+    fn order_sql(&self) -> &'static str {
+        match self {
+            CrawlDirection::Front => "ASC",
+            CrawlDirection::Back => "DESC",
+        }
+    }
 }
 
 #[tokio::main]
@@ -103,6 +133,8 @@ async fn main() {
         let host_access: Arc<Mutex<HashMap<String, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
         let host_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>> = Arc::new(Mutex::new(HashMap::new()));
         let workers: usize = std::env::var("CRAWL_WORKERS").ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+        let direction = CrawlDirection::from_env();
+        println!("Crawl direction: {:?}", direction);
 
         for _ in 0..workers {
             let pool_worker = pool_crawler.clone();
@@ -110,7 +142,7 @@ async fn main() {
             let host_semaphores = host_semaphores.clone();
             let storage_tx = storage_tx.clone();
             tokio::spawn(async move {
-                run_crawler_with_politeness(pool_worker, host_access, host_semaphores, storage_tx).await;
+                run_crawler_with_politeness(pool_worker, host_access, host_semaphores, storage_tx, direction).await;
             });
         }
     }
@@ -153,19 +185,27 @@ async fn run_crawler_with_politeness(
     host_access: Arc<Mutex<HashMap<String, Instant>>>,
     host_semaphores: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     storage_tx: mpsc::UnboundedSender<StorageTask>,
+    direction: CrawlDirection,
 ) {
     let politeness = Duration::from_secs(1);
+    // Direction only controls which end of the backlog we prefer to work from
+    // (front = oldest pending ids, back = newest). Correctness against duplicate
+    // claims comes from the atomic UPDATE...RETURNING below regardless of order —
+    // this just keeps two concurrently-running crawlers from converging on the
+    // same rows for most of their run.
+    let claim_sql = format!(
+        "UPDATE crawl_queue SET status = 'processing', attempted_at = now() WHERE id = (
+            SELECT id FROM crawl_queue WHERE (status = 'pending' OR (status = 'failed' AND attempted_at < now() - INTERVAL '1 hour')) ORDER BY id {} LIMIT 1
+        ) RETURNING id, url",
+        direction.order_sql()
+    );
     loop {
         // Atomically claim a pending row to avoid races between workers.
         // Claim a pending row, or retry failed rows that are old enough (visibility/backoff)
-        let row: Option<(i32, String)> = sqlx::query_as(
-            "UPDATE crawl_queue SET status = 'processing', attempted_at = now() WHERE id = (
-                SELECT id FROM crawl_queue WHERE (status = 'pending' OR (status = 'failed' AND attempted_at < now() - INTERVAL '1 hour')) ORDER BY id ASC LIMIT 1
-            ) RETURNING id, url"
-        )
-        .fetch_optional(pool.as_ref())
-        .await
-        .unwrap_or(None);
+        let row: Option<(i32, String)> = sqlx::query_as(&claim_sql)
+            .fetch_optional(pool.as_ref())
+            .await
+            .unwrap_or(None);
 
         match row {
             Some((id, url)) => {
