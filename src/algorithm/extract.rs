@@ -14,7 +14,6 @@
 
 use ego_tree::NodeRef;
 use scraper::{Html, Node, Selector};
-use std::collections::HashSet;
 
 const SKIP_TAGS: &[&str] = &["script", "style", "noscript", "template", "svg", "iframe"];
 
@@ -81,34 +80,58 @@ pub fn meta_description(document: &Html) -> Option<String> {
 /// times in the raw DOM. Collapse consecutive/repeated short runs so a
 /// snippet doesn't end up as "scan get mobile app" x8.
 pub fn dedupe_boilerplate(text: &str) -> String {
-    // Split on multiple spaces isn't enough since we already joined with
-    // single spaces; instead split into "chunks" using simple heuristics:
-    // treat runs of >=4 words that repeat verbatim elsewhere in the text as
-    // boilerplate after the first occurrence.
+    // Detect a phrase of some length k that repeats immediately after
+    // itself (back-to-back), keep one copy, and skip all further
+    // consecutive repeats of it. Try larger block sizes first so a longer
+    // repeated phrase doesn't get partially matched by a shorter one and
+    // leave a stray tail behind.
     let words: Vec<&str> = text.split_whitespace().collect();
-    const WINDOW: usize = 5;
-    if words.len() < WINDOW * 2 {
+    let n = words.len();
+    if n < 4 {
         return text.to_string();
     }
 
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<&str> = Vec::with_capacity(words.len());
+    const MAX_BLOCK: usize = 12;
+    let mut out: Vec<&str> = Vec::with_capacity(n);
     let mut i = 0;
-    while i < words.len() {
-        if i + WINDOW <= words.len() {
-            let window = words[i..i + WINDOW].join(" ").to_lowercase();
-            if seen.contains(&window) {
-                // Skip this whole repeated window, it's a re-occurrence of
-                // something we've already kept once.
-                i += WINDOW;
-                continue;
+    while i < n {
+        let max_k = ((n - i) / 2).min(MAX_BLOCK);
+        let mut matched_block = 0usize;
+        for k in (2..=max_k).rev() {
+            if words[i..i + k].eq_ignore_ascii_case_slice(&words[i + k..i + 2 * k]) {
+                matched_block = k;
+                break;
             }
-            seen.insert(window);
         }
-        out.push(words[i]);
-        i += 1;
+
+        if matched_block > 0 {
+            out.extend_from_slice(&words[i..i + matched_block]);
+            let mut j = i + matched_block;
+            while j + matched_block <= n
+                && words[j..j + matched_block].eq_ignore_ascii_case_slice(&words[i..i + matched_block])
+            {
+                j += matched_block;
+            }
+            i = j;
+        } else {
+            out.push(words[i]);
+            i += 1;
+        }
     }
     out.join(" ")
+}
+
+trait EqIgnoreCaseSlice {
+    fn eq_ignore_ascii_case_slice(&self, other: &Self) -> bool;
+}
+impl EqIgnoreCaseSlice for [&str] {
+    fn eq_ignore_ascii_case_slice(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self
+                .iter()
+                .zip(other.iter())
+                .all(|(a, b)| a.to_lowercase() == b.to_lowercase())
+    }
 }
 
 /// Builds the display snippet with the priority: meta description > deduped
