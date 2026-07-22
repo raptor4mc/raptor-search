@@ -353,6 +353,38 @@ pub async fn storage_worker(
     }
 }
 
+// Backblaze B2's S3-compatible API needs a client pointed at B2's endpoint
+// with B2's own credentials — `aws_config::load_from_env()` only knows about
+// standard AWS_* env vars, so it silently connects to nothing useful (or
+// errors) when given B2_KEY_ID/B2_APPLICATION_KEY. This builds an explicit
+// client instead.
+async fn build_b2_client(endpoint: &str, key_id: &str, app_key: &str) -> aws_sdk_s3::Client {
+    let region = extract_region_from_endpoint(endpoint).unwrap_or_else(|| "us-west-004".to_string());
+    let creds = aws_credential_types::Credentials::new(key_id, app_key, None, None, "b2-static");
+    let config = aws_sdk_s3::config::Builder::new()
+        .behavior_version(aws_config::BehaviorVersion::latest())
+        .region(aws_sdk_s3::config::Region::new(region))
+        .endpoint_url(endpoint)
+        .credentials_provider(creds)
+        // B2's S3-compatible API expects path-style requests
+        // (https://endpoint/bucket/key) rather than virtual-hosted-style
+        // (https://bucket.endpoint/key).
+        .force_path_style(true)
+        .build();
+    aws_sdk_s3::Client::from_conf(config)
+}
+
+// B2 endpoints look like https://s3.us-west-004.backblazeb2.com — the
+// region code is the middle segment.
+fn extract_region_from_endpoint(endpoint: &str) -> Option<String> {
+    let host = endpoint
+        .trim_start_matches("https://")
+        .trim_start_matches("http://");
+    let mut parts = host.split('.');
+    parts.next()?; // "s3"
+    parts.next().map(|s| s.to_string())
+}
+
 async fn process_storage_task(
     pool: &PgPool,
     task: &StorageTask,
@@ -369,10 +401,19 @@ async fn process_storage_task(
         encoder.finish()?;
     }
 
-    // Try S3 if configured, otherwise disk
-    if let Ok(bucket) = std::env::var("S3_BUCKET") {
+    // Try B2 if configured (matches the env vars your GitHub Actions
+    // workflow already sets: B2_BUCKET_NAME, B2_ENDPOINT, B2_KEY_ID,
+    // B2_APPLICATION_KEY), otherwise fall back to disk.
+    let b2_config = (
+        std::env::var("B2_BUCKET_NAME"),
+        std::env::var("B2_ENDPOINT"),
+        std::env::var("B2_KEY_ID"),
+        std::env::var("B2_APPLICATION_KEY"),
+    );
+
+    if let (Ok(bucket), Ok(endpoint), Ok(key_id), Ok(app_key)) = b2_config {
         let key = format!("pages/{}.zst", task.content_hash);
-        
+
         // Ensure table exists
         let _ = sqlx::query(
             "CREATE TABLE IF NOT EXISTS page_blobs (
@@ -385,9 +426,8 @@ async fn process_storage_task(
         .execute(pool)
         .await;
 
-        // Upload to S3
-        let config = aws_config::load_from_env().await;
-        let client = aws_sdk_s3::Client::new(&config);
+        // Upload to B2
+        let client = build_b2_client(&endpoint, &key_id, &app_key).await;
         client
             .put_object()
             .bucket(&bucket)
@@ -436,15 +476,19 @@ pub async fn prune_old_pages(pool: &PgPool) -> Result<usize, Box<dyn std::error:
     .await?
     .len();
 
-    // Optionally prune page_blobs and S3 objects
-    if let Ok(bucket) = std::env::var("S3_BUCKET") {
+    // Optionally prune page_blobs and B2 objects
+    if let (Ok(bucket), Ok(endpoint), Ok(key_id), Ok(app_key)) = (
+        std::env::var("B2_BUCKET_NAME"),
+        std::env::var("B2_ENDPOINT"),
+        std::env::var("B2_KEY_ID"),
+        std::env::var("B2_APPLICATION_KEY"),
+    ) {
         let rows: Vec<(String,String)> = sqlx::query_as("SELECT content_hash, s3_key FROM page_blobs WHERE uploaded_at < now() - ($1::interval)")
             .bind(format!("{} days", days))
             .fetch_all(pool)
             .await?;
         if !rows.is_empty() {
-            let config = aws_config::load_from_env().await;
-            let client = aws_sdk_s3::Client::new(&config);
+            let client = build_b2_client(&endpoint, &key_id, &app_key).await;
             for (_hash, key) in rows.iter() {
                 let _ = client.delete_object().bucket(&bucket).key(key).send().await;
             }
