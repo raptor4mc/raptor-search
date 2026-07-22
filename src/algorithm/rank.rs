@@ -31,7 +31,7 @@ SELECT title, url, snippet,
         * domain_match_boost(url, $1)
         * title_match_boost(title, $1)
         * homepage_boost(url)
-    ) AS score
+    )::double precision AS score
 FROM pages
 WHERE search_vector @@ websearch_to_tsquery('english', $1)
 ORDER BY score DESC
