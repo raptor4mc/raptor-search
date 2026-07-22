@@ -3,7 +3,7 @@ use axum::{
     extract::{Query, State},
     routing::{get, post},
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sqlx::PgPool;
 use std::sync::Arc;
 use tower_http::{
@@ -11,9 +11,12 @@ use tower_http::{
     services::ServeDir,
 };
 
+mod algorithm;
 mod crawl;
 mod db;
 
+use algorithm::rank::SEARCH_SQL;
+use algorithm::sitelinks::{group_by_domain, GroupedResult, ResultItem};
 use crawl::{crawl, is_junk_url, store_page, storage_worker, StorageTask};
 use db::init_db;
 use std::collections::HashMap;
@@ -357,40 +360,32 @@ struct SearchQuery {
     page: Option<i64>,
 }
 
-#[derive(Serialize)]
-struct ResultItem {
-    title: String,
-    url: String,
-    snippet: String,
-}
-
 async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchQuery>,
-) -> Json<Vec<ResultItem>> {
+) -> Json<Vec<GroupedResult>> {
     let page = params.page.unwrap_or(0);
+    // Pull extra rows beyond the visible page size — sitelink candidates
+    // (subpages of the same domain as a top result) need to be fetched
+    // even though they won't each get their own top-level slot.
+    const RAW_FETCH: i64 = 40;
     let offset = page * 10;
 
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT title, url, snippet
-         FROM pages
-         WHERE search_vector @@ websearch_to_tsquery('english', $1)
-         ORDER BY
-             ts_rank(search_vector, websearch_to_tsquery('english', $1))
-             * log(2 + inbound_links) DESC
-         LIMIT 10 OFFSET $2"
-    )
-    .bind(&params.q)
-    .bind(offset)
-    .fetch_all(state.db.as_ref())
-    .await
-    .unwrap_or_default();
+    let rows: Vec<(String, String, String, f64)> = sqlx::query_as(SEARCH_SQL)
+        .bind(&params.q)
+        .bind(RAW_FETCH)
+        .bind(offset)
+        .fetch_all(state.db.as_ref())
+        .await
+        .unwrap_or_default();
 
-    Json(
-        rows.into_iter()
-            .map(|(title, url, snippet)| ResultItem { title, url, snippet })
-            .collect(),
-    )
+    let items: Vec<ResultItem> = rows
+        .into_iter()
+        .map(|(title, url, snippet, _score)| ResultItem { title, url, snippet })
+        .collect();
+
+    let grouped = group_by_domain(items, 10, 4);
+    Json(grouped)
 }
 
 #[derive(Deserialize)]
