@@ -3,12 +3,14 @@ use scraper::{Html, Selector};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use once_cell::sync::Lazy;
-use rust_stemmers::{Algorithm, Stemmer};
 use std::time::Duration;
 use std::io::Write;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use std::sync::Arc;
+
+use crate::algorithm::extract;
+use crate::algorithm::tokenize;
 
 static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
@@ -17,17 +19,6 @@ static CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
         .build()
         .expect("failed to build http client")
 });
-
-static STEMMER: Lazy<Stemmer> = Lazy::new(|| Stemmer::create(Algorithm::English));
-
-const STOPWORDS: &[&str] = &[
-    "a", "an", "the", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with", "by",
-    "from", "is", "it", "its", "was", "are", "be", "been", "has", "had", "have", "will", "would",
-    "could", "should", "may", "might", "do", "does", "did", "not", "no", "so", "if", "as", "up",
-    "out", "about", "into", "than", "then", "that", "this", "these", "those", "they", "them",
-    "their", "there", "when", "where", "which", "who", "how", "what", "we", "you", "i", "he",
-    "she", "my", "your", "our", "can", "also",
-];
 
 const BAD_EXTENSIONS: &[&str] = &[
     ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".zip", ".tar",
@@ -79,6 +70,11 @@ pub struct StorageTask {
 pub struct CrawledPage {
     pub title: String,
     pub snippet: String,
+    /// Clean, deduped, script/style-free text — this is what actually gets
+    /// indexed for full-text search (see migrations/002_algorithm_upgrade.sql).
+    /// Capped to a reasonable length so the index doesn't bloat.
+    pub body_text: String,
+    pub meta_description: Option<String>,
     pub content_hash: String,
     pub content: String,
     pub discovered_urls: Vec<String>,
@@ -185,22 +181,29 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
         .map(|t| t.inner_html())
         .unwrap_or_else(|| "No title".to_string());
 
-    // Extract from <p> tags first for better snippets
-    let p_sel = Selector::parse("p").unwrap();
-    let p_text: String = document
-        .select(&p_sel)
-        .map(|el| el.text().collect::<Vec<_>>().join(" "))
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Visible, script/style-free text (see algorithm::extract for why this
+    // matters — the old `.text()` call over the whole document pulled in
+    // raw CSS/JS as if it were page content).
+    let main_text = extract::main_content_text(&document);
+    let meta_description = extract::meta_description(&document);
 
-    let raw_text = if p_text.trim().len() > 100 {
-        p_text
+    // raw_text is what gets hashed for change-detection and archived to
+    // disk/S3 — keep it as the full clean visible text, not the fallback
+    // whole-doc-with-script-tags text the old code used.
+    let raw_text = if !main_text.is_empty() {
+        main_text.clone()
     } else {
-        document.root_element().text().collect::<Vec<_>>().join(" ")
+        extract::visible_text(&document)
     };
 
-    let filtered = filter_stopwords(&raw_text);
-    let snippet: String = filtered.chars().take(200).collect();
+    // Display snippet: meta description first, then deduped body text.
+    // Never derived from stemmed/stopword-filtered text.
+    let snippet = extract::build_snippet(&document, &main_text, 200);
+
+    // body_text is the deduped, capped text that actually gets indexed for
+    // full-text search (see store_page + migration for the new column).
+    let deduped = extract::dedupe_boilerplate(&raw_text);
+    let body_text: String = deduped.chars().take(5000).collect();
 
     let mut hasher = Sha256::new();
     hasher.update(raw_text.as_bytes());
@@ -256,27 +259,20 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
     Ok(CrawledPage {
         title,
         snippet,
+        body_text,
+        meta_description,
         content_hash,
         content: raw_text,
         discovered_urls,
     })
 }
 
-fn filter_stopwords(text: &str) -> String {
-    text.split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !c.is_alphabetic()))
-        .filter(|word| {
-            let lower = word.to_lowercase();
-            let clean: String = lower.chars().filter(|c| c.is_alphabetic()).collect();
-            !clean.is_empty() && !STOPWORDS.contains(&clean.as_str())
-        })
-        .map(|w| {
-            let lower = w.to_lowercase();
-            let clean: String = lower.chars().filter(|c| c.is_alphabetic()).collect();
-            STEMMER.stem(&clean).to_string()
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+// Kept for callers that need stemmed/stopword-filtered tokens (e.g. building
+// a custom inverted index instead of relying on Postgres tsvector). Never
+// use this output as display text — see algorithm::tokenize doc comment.
+#[allow(dead_code)]
+pub fn index_tokens_for(text: &str) -> String {
+    tokenize::index_text(text)
 }
 
 pub async fn store_page(
@@ -285,8 +281,13 @@ pub async fn store_page(
     page: &CrawledPage,
     storage_tx: Option<mpsc::UnboundedSender<StorageTask>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Skip junk pages
-    if JUNK_SIGNALS.iter().any(|s| page.snippet.contains(s)) {
+    // Skip junk pages. Checked against page.content (script/style already
+    // stripped by algorithm::extract), not the display snippet — previously
+    // this ran against the snippet built from *unfiltered* text, so a page
+    // with an inline <style> containing ":root {" (extremely common on
+    // modern sites) would trip this and get silently dropped from the index
+    // entirely, no matter how good its actual content was.
+    if JUNK_SIGNALS.iter().any(|s| page.content.contains(s)) {
         println!("Skipping junk: {}", url);
         return Ok(());
     }
@@ -308,18 +309,22 @@ pub async fn store_page(
     }
 
     sqlx::query(
-        "INSERT INTO pages (url, title, snippet, content_hash)
-         VALUES ($1, $2, $3, $4)
+        "INSERT INTO pages (url, title, snippet, content_hash, body_text, meta_description)
+         VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (url) DO UPDATE SET
              title = EXCLUDED.title,
              snippet = EXCLUDED.snippet,
              content_hash = EXCLUDED.content_hash,
+             body_text = EXCLUDED.body_text,
+             meta_description = EXCLUDED.meta_description,
              crawled_at = now()",
     )
     .bind(url)
     .bind(&page.title)
     .bind(&page.snippet)
     .bind(&page.content_hash)
+    .bind(&page.body_text)
+    .bind(&page.meta_description)
     .execute(pool)
     .await?;
 
