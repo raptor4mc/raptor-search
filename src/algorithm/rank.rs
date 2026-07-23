@@ -31,6 +31,7 @@ SELECT title, url, snippet,
         * domain_match_boost(url, $1)
         * title_match_boost(title, $1)
         * homepage_boost(url)
+        * structural_boost(is_canonical, has_structured_data, mobile_friendly)
     )::double precision AS score
 FROM pages
 WHERE search_vector @@ websearch_to_tsquery('english', $1)
@@ -92,6 +93,26 @@ BEGIN
     ELSE
         RETURN 1.0;
     END IF;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+-- Uses the structural columns populated by algorithm::metadata. These are
+-- NULL for any row that hasn't been recrawled under the new extraction code
+-- yet, so every branch here is written to fall back to a neutral 1.0
+-- multiplier on NULL rather than penalizing or erroring on not-yet-processed
+-- pages (SQL's `= true`/`= false` comparisons against NULL evaluate to NULL,
+-- which falls through to ELSE, not TRUE — that's what makes this safe).
+CREATE OR REPLACE FUNCTION structural_boost(
+    is_canonical BOOLEAN,
+    has_structured_data BOOLEAN,
+    mobile_friendly BOOLEAN
+)
+RETURNS DOUBLE PRECISION AS $$
+BEGIN
+    RETURN
+        (CASE WHEN is_canonical = false THEN 0.7 ELSE 1.0 END)
+        * (CASE WHEN has_structured_data = true THEN 1.15 ELSE 1.0 END)
+        * (CASE WHEN mobile_friendly = true THEN 1.05 ELSE 1.0 END);
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 "#;
