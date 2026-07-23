@@ -11,6 +11,7 @@
 //   sitelinks.rs  - grouping same-domain results together for display
 
 pub mod extract;
+pub mod metadata;
 pub mod rank;
 pub mod sitelinks;
 pub mod tokenize;
