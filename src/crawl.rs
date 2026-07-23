@@ -78,6 +78,7 @@ pub struct CrawledPage {
     pub content_hash: String,
     pub content: String,
     pub discovered_urls: Vec<String>,
+    pub metadata: crate::algorithm::metadata::PageMetadata,
 }
 
 pub fn is_junk_url(url: &str) -> bool {
@@ -150,6 +151,7 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
     // Retry GET with exponential backoff for transient errors.
     let max_retries: u32 = std::env::var("CRAWL_MAX_RETRIES").ok().and_then(|s| s.parse().ok()).unwrap_or(3);
     let mut attempt: u32 = 0;
+    let fetch_start = std::time::Instant::now();
     let body = loop {
         let res = CLIENT.get(url).send().await;
         match res {
@@ -172,6 +174,7 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
         let backoff = 2u64.pow(attempt.min(6));
         tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
     };
+    let page_load_time_ms = fetch_start.elapsed().as_millis() as i32;
     let document = Html::parse_document(&body);
 
     let title_sel = Selector::parse("title").unwrap();
@@ -212,40 +215,65 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
     let link_sel = Selector::parse("a[href]").unwrap();
     let base_url = reqwest::Url::parse(url)?;
     let mut discovered_urls = Vec::new();
+    let mut internal_links_count: i32 = 0;
+    let mut external_links_count: i32 = 0;
 
     let should_follow = !NO_FOLLOW_DOMAINS.iter().any(|d| {
         base_url.host_str().unwrap_or("").contains(d)
     });
 
-    if should_follow {
-        for element in document.select(&link_sel) {
-            if let Some(href) = element.value().attr("href") {
-                let absolute = if href.starts_with("http") {
-                    href.to_string()
-                } else if href.starts_with('/') {
-                    format!(
-                        "{}://{}{}",
-                        base_url.scheme(),
-                        base_url.host_str().unwrap_or(""),
-                        href
-                    )
-                } else {
-                    continue;
-                };
+    for element in document.select(&link_sel) {
+        if let Some(href) = element.value().attr("href") {
+            let absolute = if href.starts_with("http") {
+                href.to_string()
+            } else if href.starts_with('/') {
+                format!(
+                    "{}://{}{}",
+                    base_url.scheme(),
+                    base_url.host_str().unwrap_or(""),
+                    href
+                )
+            } else {
+                continue;
+            };
 
-                let lower = absolute.to_lowercase();
-                if !lower.contains('#')
-                    && absolute.starts_with("http")
-                    && !BAD_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
-                    && !SKIP_URL_PATTERNS.iter().any(|p| absolute.contains(p))
-                {
-                    if let Some(n) = normalize_url(&absolute) {
-                        discovered_urls.push(n);
-                    }
+            // Count every real link toward the structural signal, even on
+            // no-follow domains — should_follow only controls whether we
+            // queue the URL for further crawling, it shouldn't also zero
+            // out the link-count signal for those pages.
+            if let Ok(link_url) = reqwest::Url::parse(&absolute) {
+                if link_url.host_str() == base_url.host_str() {
+                    internal_links_count += 1;
+                } else {
+                    external_links_count += 1;
+                }
+            }
+
+            if !should_follow {
+                continue;
+            }
+
+            let lower = absolute.to_lowercase();
+            if !lower.contains('#')
+                && absolute.starts_with("http")
+                && !BAD_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+                && !SKIP_URL_PATTERNS.iter().any(|p| absolute.contains(p))
+            {
+                if let Some(n) = normalize_url(&absolute) {
+                    discovered_urls.push(n);
                 }
             }
         }
     }
+
+    let metadata = crate::algorithm::metadata::extract(
+        &document,
+        url,
+        body_text.len(),
+        internal_links_count,
+        external_links_count,
+        page_load_time_ms,
+    );
 
     // Limit discovered URLs per page to avoid queue explosion
     let max_discovered: usize = std::env::var("MAX_DISCOVERED_PER_PAGE")
@@ -264,6 +292,7 @@ pub async fn crawl(url: &str) -> Result<CrawledPage, Box<dyn std::error::Error +
         content_hash,
         content: raw_text,
         discovered_urls,
+        metadata,
     })
 }
 
@@ -309,14 +338,35 @@ pub async fn store_page(
     }
 
     sqlx::query(
-        "INSERT INTO pages (url, title, snippet, content_hash, body_text, meta_description)
-         VALUES ($1, $2, $3, $4, $5, $6)
+        "INSERT INTO pages (
+            url, title, snippet, content_hash, body_text, meta_description,
+            content_length, heading_count, external_links_count, internal_links_count,
+            url_depth, is_https, canonical_url, is_canonical, has_structured_data,
+            schema_type, image_count, video_count, hreflang_languages, mobile_friendly,
+            page_load_time_ms
+         )
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
          ON CONFLICT (url) DO UPDATE SET
              title = EXCLUDED.title,
              snippet = EXCLUDED.snippet,
              content_hash = EXCLUDED.content_hash,
              body_text = EXCLUDED.body_text,
              meta_description = EXCLUDED.meta_description,
+             content_length = EXCLUDED.content_length,
+             heading_count = EXCLUDED.heading_count,
+             external_links_count = EXCLUDED.external_links_count,
+             internal_links_count = EXCLUDED.internal_links_count,
+             url_depth = EXCLUDED.url_depth,
+             is_https = EXCLUDED.is_https,
+             canonical_url = EXCLUDED.canonical_url,
+             is_canonical = EXCLUDED.is_canonical,
+             has_structured_data = EXCLUDED.has_structured_data,
+             schema_type = EXCLUDED.schema_type,
+             image_count = EXCLUDED.image_count,
+             video_count = EXCLUDED.video_count,
+             hreflang_languages = EXCLUDED.hreflang_languages,
+             mobile_friendly = EXCLUDED.mobile_friendly,
+             page_load_time_ms = EXCLUDED.page_load_time_ms,
              crawled_at = now()",
     )
     .bind(url)
@@ -325,6 +375,21 @@ pub async fn store_page(
     .bind(&page.content_hash)
     .bind(&page.body_text)
     .bind(&page.meta_description)
+    .bind(page.metadata.content_length)
+    .bind(page.metadata.heading_count)
+    .bind(page.metadata.external_links_count)
+    .bind(page.metadata.internal_links_count)
+    .bind(page.metadata.url_depth)
+    .bind(page.metadata.is_https)
+    .bind(&page.metadata.canonical_url)
+    .bind(page.metadata.is_canonical)
+    .bind(page.metadata.has_structured_data)
+    .bind(&page.metadata.schema_type)
+    .bind(page.metadata.image_count)
+    .bind(page.metadata.video_count)
+    .bind(&page.metadata.hreflang_languages)
+    .bind(page.metadata.mobile_friendly)
+    .bind(page.metadata.page_load_time_ms)
     .execute(pool)
     .await?;
 
